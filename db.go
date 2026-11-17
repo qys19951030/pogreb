@@ -287,19 +287,10 @@ func (db *DB) put(sl slot, key []byte) error {
 	})
 }
 
-// Put sets the value for the given key. It updates the value for the existing key.
-func (db *DB) Put(key []byte, value []byte) error {
-	if len(key) > MaxKeyLength {
-		return errKeyTooLarge
-	}
-	if len(value) > MaxValueLength {
-		return errValueTooLarge
-	}
+// putLocked applies a Put operation while the caller holds db.mu.
+// It shares the post-validation implementation with Put.
+func (db *DB) putLocked(key []byte, value []byte) error {
 	h := db.hash(key)
-	db.metrics.Puts.Add(1)
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
 	segID, offset, err := db.datalog.put(key, value)
 	if err != nil {
 		return err
@@ -317,6 +308,31 @@ func (db *DB) Put(key []byte, value []byte) error {
 		return err
 	}
 
+	if db.syncWrites {
+		return db.sync()
+	}
+	return nil
+}
+
+// Put sets the value for the given key. It updates the value for the existing key.
+func (db *DB) Put(key []byte, value []byte) error {
+	if len(key) > MaxKeyLength {
+		return errKeyTooLarge
+	}
+	if len(value) > MaxValueLength {
+		return errValueTooLarge
+	}
+	db.metrics.Puts.Add(1)
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.putLocked(key, value)
+}
+
+// delLocked applies a Delete operation while the caller holds db.mu.
+func (db *DB) delLocked(h uint32, key []byte) error {
+	if err := db.del(h, key, true); err != nil {
+		return err
+	}
 	if db.syncWrites {
 		return db.sync()
 	}
@@ -351,13 +367,7 @@ func (db *DB) Delete(key []byte) error {
 	db.metrics.Dels.Add(1)
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if err := db.del(h, key, true); err != nil {
-		return err
-	}
-	if db.syncWrites {
-		return db.sync()
-	}
-	return nil
+	return db.delLocked(h, key)
 }
 
 // Close closes the DB.
