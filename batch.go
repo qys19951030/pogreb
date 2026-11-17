@@ -100,6 +100,12 @@ type BatchWriter struct {
 	done          chan struct{} // Closed when the worker goroutine exits.
 	maxSize       int
 	flushInterval time.Duration
+	// beforeApply, when set, runs inside the write lock before each operation
+	// of a group is applied. Intended for in-package tests only.
+	beforeApply func(WriteOp)
+	// beforeGroup, when set, runs inside the write lock once per flushed group.
+	// Intended for in-package tests only.
+	beforeGroup func(groupSize int)
 }
 
 // NewBatchWriter wraps an already opened DB and returns a BatchWriter that
@@ -268,7 +274,13 @@ func (bw *BatchWriter) flush() {
 	// One lock acquisition for the whole group; individual operations reuse
 	// the same in-lock implementation as DB.Put and DB.Delete.
 	bw.db.mu.Lock()
+	if bw.beforeGroup != nil {
+		bw.beforeGroup(len(group))
+	}
 	for _, entry := range group {
+		if bw.beforeApply != nil {
+			bw.beforeApply(entry.op)
+		}
 		err := bw.applyLocked(entry.op)
 		entry.result.err = err
 		close(entry.result.done)

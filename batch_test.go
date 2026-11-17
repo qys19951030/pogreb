@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/akrylysov/pogreb/internal/assert"
 )
@@ -290,6 +291,139 @@ func TestBatchEmptySubmit(t *testing.T) {
 	assert.Nil(t, err)
 	assert.Equal(t, []byte("v"), v)
 
+	assert.Nil(t, bw.Close())
+	assert.Nil(t, db.Close())
+}
+
+// TestBatchSingleLockPerGroup verifies that all operations in one group are
+// applied under a single DB write lock acquisition.
+func TestBatchSingleLockPerGroup(t *testing.T) {
+	db := mustDB(t)
+	bw := NewBatchWriter(db)
+
+	var lockMu sync.Mutex
+	groupLocks := 0
+	applied := 0
+	bw.beforeGroup = func(groupSize int) {
+		lockMu.Lock()
+		groupLocks++
+		lockMu.Unlock()
+	}
+	bw.beforeApply = func(WriteOp) {
+		lockMu.Lock()
+		applied++
+		lockMu.Unlock()
+
+		// While the group lock is held, trying to take the write lock directly
+		// must block: a single writer is allowed at a time.
+		acquired := make(chan struct{})
+		go func() {
+			db.mu.Lock()
+			close(acquired)
+			db.mu.Unlock()
+		}()
+		select {
+		case <-acquired:
+			t.Fatal("DB write lock was available while a group was being applied")
+		default:
+		}
+	}
+
+	const ops = 32 // Smaller than defaultBatchMaxSize, so everything is one group.
+	ops2 := make([]WriteOp, ops)
+	for i := range ops2 {
+		ops2[i] = PutOp([]byte(fmt.Sprintf("lock-k%d", i)), []byte("v"))
+	}
+	results, err := bw.Submit(ops2...)
+	assert.Nil(t, err)
+	waitAll(t, results)
+	assert.Nil(t, bw.Close())
+
+	lockMu.Lock()
+	assert.Equal(t, 1, groupLocks)
+	assert.Equal(t, ops, applied)
+	lockMu.Unlock()
+
+	assert.Nil(t, db.Close())
+}
+
+// TestBatchSyncWrites verifies that when the DB is opened with synchronous
+// writes (BackgroundSyncInterval == -1), batched writes are durable with the
+// same guarantee as an individual DB.Put: every group flushes through the same
+// sync path, and all data is readable afterwards.
+func TestBatchSyncWrites(t *testing.T) {
+	opts := &Options{BackgroundSyncInterval: -1, FileSystem: testFS}
+	db, err := createTestDB(opts)
+	assert.Nil(t, err)
+	assert.Equal(t, true, db.syncWrites)
+	bw := NewBatchWriter(db)
+
+	results, err := bw.Submit(
+		PutOp([]byte("sync-1"), []byte("a")),
+		PutOp([]byte("sync-2"), []byte("b")),
+		DeleteOp([]byte("sync-1")),
+	)
+	assert.Nil(t, err)
+	waitAll(t, results)
+
+	v, err := db.Get([]byte("sync-2"))
+	assert.Nil(t, err)
+	assert.Equal(t, []byte("b"), v)
+	has, err := db.Has([]byte("sync-1"))
+	assert.Nil(t, err)
+	assert.Equal(t, false, has)
+
+	assert.Nil(t, bw.Close())
+	// Close the original handle first to release the lock, then reopen and
+	// verify the synchronously written data survives a fresh open.
+	assert.Nil(t, db.Close())
+
+	db2, err := Open(testDBName, &Options{FileSystem: testFS})
+	assert.Nil(t, err)
+	v, err = db2.Get([]byte("sync-2"))
+	assert.Nil(t, err)
+	assert.Equal(t, []byte("b"), v)
+	has, err = db2.Has([]byte("sync-1"))
+	assert.Nil(t, err)
+	assert.Equal(t, false, has)
+	assert.Nil(t, db2.Close())
+}
+
+// TestBatchCompactionConcurrent verifies that background compaction does not
+// interfere with batched writes; the writer does not depend on segment layout.
+func TestBatchCompactionConcurrent(t *testing.T) {
+	opts := &Options{
+		BackgroundCompactionInterval: time.Millisecond,
+		FileSystem:                   testFS,
+	}
+	db, err := createTestDB(opts)
+	assert.Nil(t, err)
+	bw := NewBatchWriter(db)
+
+	const n = 500
+	var wg sync.WaitGroup
+	errCh := make(chan error, 1)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		local := make([]*Result, 0, n)
+		for i := 0; i < n; i++ {
+			r, err := bw.Put([]byte(fmt.Sprintf("compact-k%d", i)), []byte("v"))
+			if err != nil {
+				errCh <- err
+				return
+			}
+			local = append(local, r)
+		}
+		waitAll(t, local)
+	}()
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("unexpected error during compaction: %v", err)
+	}
+
+	assert.Equal(t, uint32(n), db.Count())
 	assert.Nil(t, bw.Close())
 	assert.Nil(t, db.Close())
 }
