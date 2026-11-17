@@ -1,7 +1,6 @@
 package pogreb
 
 import (
-	"bytes"
 	"fmt"
 	"sync"
 	"testing"
@@ -151,21 +150,146 @@ func TestBatchSameKeyOrdering(t *testing.T) {
 // its own error without rolling back already applied operations or stopping
 // subsequent groups.
 func TestBatchFailureIsolation(t *testing.T) {
+	db := mustDB(t)
+	bw := NewBatchWriter(db)
+
+	// An oversized key is rejected by the same validation DB.Put applies.
+	badKey := make([]byte, MaxKeyLength+1)
+	for i := range badKey {
+		badKey[i] = 'x'
+	}
+
+	// One group, in submission order: good Put, bad Put, good Put.
+	results, err := bw.Submit(
+		PutOp([]byte("before"), []byte("1")),
+		PutOp(badKey, []byte("nope")),
+		PutOp([]byte("after"), []byte("2")),
+	)
+	assert.Nil(t, err)
+	assert.Equal(t, 3, len(results))
+
+	// The failure is reported on the corresponding result only.
+	assert.Nil(t, waitOne(results[0]))
+	assert.Equal(t, errKeyTooLarge, waitOne(results[1]))
+	assert.Nil(t, waitOne(results[2]))
+	assert.Equal(t, badKey, results[1].Key())
+
+	// Applied operations are not rolled back; operations after the failure ran.
+	v, err := db.Get([]byte("before"))
+	assert.Nil(t, err)
+	assert.Equal(t, []byte("1"), v)
+	v, err = db.Get([]byte("after"))
+	assert.Nil(t, err)
+	assert.Equal(t, []byte("2"), v)
+
+	// The writer keeps accepting and flushing subsequent groups.
+	more, err := bw.Submit(
+		PutOp([]byte("next-group"), []byte("ok")),
+		DeleteOp([]byte("before")),
+	)
+	assert.Nil(t, err)
+	waitAll(t, more)
+	v, err = db.Get([]byte("next-group"))
+	assert.Nil(t, err)
+	assert.Equal(t, []byte("ok"), v)
+	has, err := db.Has([]byte("before"))
+	assert.Nil(t, err)
+	assert.Equal(t, false, has)
+
+	assert.Nil(t, bw.Close())
+	assert.Nil(t, db.Close())
 }
 
 // TestBatchCloseDrainAndReject verifies that Close flushes in-flight groups,
 // delivers results and rejects further submissions.
 func TestBatchCloseDrainAndReject(t *testing.T) {
+	db := mustDB(t)
+	bw := NewBatchWriter(db)
+
+	// Submit a group smaller than max size so it only gets flushed by Close.
+	results, err := bw.Submit(
+		PutOp([]byte("drained-1"), []byte("a")),
+		PutOp([]byte("drained-2"), []byte("b")),
+		DeleteOp([]byte("missing")),
+	)
+	assert.Nil(t, err)
+
+	// Close must drain every in-flight operation before returning.
+	assert.Nil(t, bw.Close())
+	waitAll(t, results)
+
+	// Real DB contents reflect the drained group.
+	v, err := db.Get([]byte("drained-1"))
+	assert.Nil(t, err)
+	assert.Equal(t, []byte("a"), v)
+	v, err = db.Get([]byte("drained-2"))
+	assert.Nil(t, err)
+	assert.Equal(t, []byte("b"), v)
+
+	// New submissions are explicitly rejected, never silently dropped.
+	_, err = bw.Submit(PutOp([]byte("rejected"), []byte("x")))
+	assert.Equal(t, ErrBatchWriterClosed, err)
+	_, err = bw.Put([]byte("rejected-2"), []byte("x"))
+	assert.Equal(t, ErrBatchWriterClosed, err)
+	_, err = bw.Delete([]byte("rejected-3"))
+	assert.Equal(t, ErrBatchWriterClosed, err)
+
+	has, err := db.Has([]byte("rejected"))
+	assert.Nil(t, err)
+	assert.Equal(t, false, has)
+
+	// Closing twice is an explicit error too.
+	assert.Equal(t, ErrBatchWriterClosed, bw.Close())
+
+	// The underlying DB remains independently usable and closable.
+	err = db.Put([]byte("direct"), []byte("still works"))
+	assert.Nil(t, err)
+	v, err = db.Get([]byte("direct"))
+	assert.Nil(t, err)
+	assert.Equal(t, []byte("still works"), v)
+	assert.Nil(t, db.Close())
 }
 
 // TestBatchIdleFlush verifies that the last partial group is flushed once the
 // writer becomes idle, without relying on internal timers.
 func TestBatchIdleFlush(t *testing.T) {
+	db := mustDB(t)
+	bw := NewBatchWriter(db)
+
+	// One small group, well under max size; no further submissions follow.
+	r, err := bw.Put([]byte("idle-key"), []byte("idle-value"))
+	assert.Nil(t, err)
+
+	// The result is delivered once the idle group is flushed. The test waits on
+	// the Result instead of any internal timing.
+	assert.Nil(t, waitOne(r))
+
+	v, err := db.Get([]byte("idle-key"))
+	assert.Nil(t, err)
+	assert.Equal(t, []byte("idle-value"), v)
+
+	assert.Nil(t, bw.Close())
+	assert.Nil(t, db.Close())
 }
 
 // TestBatchEmptySubmit verifies that an empty submission produces nothing.
 func TestBatchEmptySubmit(t *testing.T) {
-}
+	db := mustDB(t)
+	bw := NewBatchWriter(db)
 
-// keep bytes imported for future assertions in this file.
-var _ = bytes.Equal
+	results, err := bw.Submit()
+	assert.Nil(t, err)
+	assert.Equal(t, 0, len(results))
+	assert.Nil(t, results)
+
+	// A normal submission afterwards still works.
+	r, err := bw.Put([]byte("after-empty"), []byte("v"))
+	assert.Nil(t, err)
+	assert.Nil(t, waitOne(r))
+	v, err := db.Get([]byte("after-empty"))
+	assert.Nil(t, err)
+	assert.Equal(t, []byte("v"), v)
+
+	assert.Nil(t, bw.Close())
+	assert.Nil(t, db.Close())
+}
